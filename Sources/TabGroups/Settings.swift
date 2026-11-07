@@ -112,6 +112,11 @@ final class SettingsWindow: NSObject, NSWindowDelegate {
         let hint = NSTextField(wrappingLabelWithString:
             "Hold the drag key to move a window by any spot. Drag it onto the middle of another, "
             + "still holding the key, and pause a moment to stack them under one strip of tabs. "
+            + "Hold Shift (⇧) and drag a window by its title bar onto another window or a pane of an existing workspace "
+            + "to build a tiled workspace of up to 4 windows; pane edges are committed to the workspace or a splitter when released. "
+            + "Hold the drag key and drag a workspace header onto another window, workspace pane, or group strip to add it as a tab. "
+            + "Double-click a tab name to rename it; an empty name resets it. "
+            + "Double-click a workspace header to fill the current display. "
             + "The switch key with 1…9 shows that tab (9: the last).")
         hint.textColor = .secondaryLabelColor
         hint.widthAnchor.constraint(equalToConstant: 300).isActive = true

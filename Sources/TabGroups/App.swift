@@ -73,6 +73,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         // Never leave windows parked in a corner; bring the groups back next time.
         groups.save()
         groups.ungroupAll()
+        groups.containers.releaseAll()
     }
 
     private func start() {

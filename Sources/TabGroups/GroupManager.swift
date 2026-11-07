@@ -3,6 +3,8 @@ import AppKit
 enum Style {
     static let stripHeight: CGFloat = 34
     static let cornerRadius: CGFloat = 10
+    static let containerCorner: CGFloat = 12
+    static let containerHeader: CGFloat = 28
 }
 
 /// Several windows (from any apps) sharing one frame under one strip.
@@ -43,6 +45,8 @@ final class GroupManager {
     private var ignoreUntil: [CGWindowID: Date] = [:]
     /// Each window's size before it joined, so a torn-off tab gets it back.
     private var sizeBeforeGrouping: [CGWindowID: CGSize] = [:]
+    /// User-given names for normal window tabs (containers keep their own).
+    private var customTitles: [CGWindowID: String] = [:]
     private var settle: DispatchWorkItem?
     private var tileDone: DispatchWorkItem?
     private var refitUntil: Date?
@@ -53,6 +57,13 @@ final class GroupManager {
     private var userResized = false
     /// The focused window of the active app, if we track it (for ⌘1…⌘9).
     private(set) var focused: CGWindowID?
+
+    /// 拼贴容器：容器壳作为一个 tab 参与分组。
+    private(set) lazy var containers: ContainerManager = {
+        let manager = ContainerManager(tracker: self.tracker)
+        manager.groups = self
+        return manager
+    }()
 
     init(tracker: WindowTracker) {
         self.tracker = tracker
@@ -66,11 +77,42 @@ final class GroupManager {
         groups.first { $0.strip.isVisible && $0.stripFrame.contains(p) }
     }
 
+    // MARK: Tab content helpers
+
+    private func tabFrame(_ id: CGWindowID) -> CGRect? {
+        if let c = containers[id] { return c.frame }
+        return tracker.windows[id]?.frame
+    }
+
+    private func placeTab(_ id: CGWindowID, in g: TabGroup, at rect: CGRect) {
+        if let c = containers[id] {
+            if c.frame != rect { c.setFrame(rect) }
+        } else if let w = tracker.windows[id] {
+            place(w, rect)
+        }
+    }
+
+    private func tabTitle(_ id: CGWindowID) -> String? {
+        if let custom = customTitles[id], !custom.isEmpty { return custom }
+        if let c = containers[id] { return c.title }
+        return tracker.windows[id]?.title
+    }
+
+    private func tabIcon(_ id: CGWindowID) -> NSImage? {
+        if let c = containers[id] { return c.icon }
+        return tracker.windows[id]?.icon
+    }
+
+    private func tabExists(_ id: CGWindowID) -> Bool {
+        containers[id] != nil || tracker.windows[id] != nil
+    }
+
     // MARK: Making and changing groups
 
     /// Drop `source` (or its whole group) onto `target` (or its group).
     func join(_ source: Win, onto target: Win) {
-        guard source.id != target.id else { return }
+        guard source.id != target.id,
+              !containers.isChild(source.id), !containers.isChild(target.id) else { return }
 
         var incoming = [source.id]
         if let old = group(of: source.id) {
@@ -98,13 +140,95 @@ final class GroupManager {
         select(source.id, in: g)
     }
 
+    /// 把普通窗口拖到容器上时，把它加成分组里的另一个 tab，而不是容器子窗口。
+    func join(_ source: Win, ontoContainer container: Container) {
+        guard container.count > 0, !containers.isChild(source.id),
+              container.children[source.id] == nil else { return }
+        if let f = source.frame { sizeBeforeGrouping[source.id] = f.size }
+        if group(of: source.id) != nil { detachForContainer(source.id) }
+
+        let g: TabGroup
+        if let existing = group(of: container.anchorID) {
+            g = existing
+        } else {
+            addContainer(container)
+            guard let made = group(of: container.anchorID) else { return }
+            g = made
+        }
+
+        let insertAt = (g.tabs.firstIndex(of: g.active) ?? g.tabs.count - 1) + 1
+        if !g.tabs.contains(source.id) { g.tabs.insert(source.id, at: insertAt) }
+        select(source.id, in: g)
+    }
+
+    /// Drop a workspace onto another window: add it as a tab in that window's
+    /// group, creating a group if the target is not grouped yet.
+    func join(_ container: Container, onto target: Win) {
+        guard group(of: container.anchorID) == nil, !containers.isChild(target.id) else { return }
+
+        let g: TabGroup
+        if let existing = group(of: target.id) {
+            g = existing
+        } else {
+            guard let f = target.frame else { return }
+            sizeBeforeGrouping[target.id] = f.size
+            let strip = TabStripPanel()
+            strip.stripDelegate = self
+            g = TabGroup(tabs: [target.id], active: target.id, frame: f, strip: strip)
+            groups.append(g)
+            if let w = tracker.windows[target.id], w.frame != g.windowFrame {
+                place(w, g.windowFrame)
+            }
+        }
+
+        if !g.tabs.contains(container.anchorID) {
+            let at = (g.tabs.firstIndex(of: g.active) ?? g.tabs.count - 1) + 1
+            g.tabs.insert(container.anchorID, at: at)
+        }
+        select(container.anchorID, in: g)
+    }
+
+    /// Drop a workspace onto an existing group's strip.
+    func join(_ container: Container, into g: TabGroup) {
+        guard group(of: container.anchorID) == nil, !g.tabs.contains(container.anchorID) else { return }
+        let at = (g.tabs.firstIndex(of: g.active) ?? g.tabs.count - 1) + 1
+        g.tabs.insert(container.anchorID, at: at)
+        select(container.anchorID, in: g)
+    }
+
+    /// Drop a workspace onto another standalone workspace: make both workspace
+    /// shells tabs of a new group (the target supplies the frame).
+    func join(_ container: Container, onto target: Container) {
+        guard container !== target, group(of: container.anchorID) == nil else { return }
+        if let g = group(of: target.anchorID) {
+            join(container, into: g)
+            return
+        }
+        let strip = TabStripPanel()
+        strip.stripDelegate = self
+        let g = TabGroup(tabs: [target.anchorID, container.anchorID],
+                         active: target.anchorID, frame: target.frame, strip: strip)
+        groups.append(g)
+        select(container.anchorID, in: g)
+    }
+
     func select(_ id: CGWindowID, in g: TabGroup) {
-        guard let w = tracker.windows[id] else { return }
+        guard tabExists(id) else { return }
+        if let previous = containers[g.active], previous !== containers[id] {
+            previous.deactivate()
+        }
         g.active = id
         // The tabs share one frame, so switching is a raise: nothing moves.
         // (Only a window just dropped on the group isn't in place yet.)
-        if w.frame != g.windowFrame { place(w, g.windowFrame) }
-        w.raise()
+        if let c = containers[id] {
+            if c.frame != g.windowFrame { c.setFrame(g.windowFrame) }
+            focused = id
+            c.activate()
+        } else if let w = tracker.windows[id] {
+            if w.frame != g.windowFrame { place(w, g.windowFrame) }
+            w.raise()
+            focused = id
+        }
         layout(g)
         reorderStrip(g)
     }
@@ -126,26 +250,42 @@ final class GroupManager {
     /// Take a tab out of its group at its old size: under the pointer when
     /// dropped at `p`, otherwise cascaded off the group's corner.
     func tearOff(_ id: CGWindowID, at p: CGPoint?) {
-        guard let g = group(of: id), let w = tracker.windows[id] else { return }
+        guard let g = group(of: id), tabExists(id) else { return }
         let size = sizeBeforeGrouping.removeValue(forKey: id) ?? g.windowFrame.size
         let origin = p.map { CGPoint(x: $0.x - size.width / 2, y: $0.y - 12) }
             ?? CGPoint(x: g.frame.minX + 28, y: g.frame.minY + 28)
+        let target = CGRect(origin: origin, size: size)
         remove(id, from: g)
-        place(w, CGRect(origin: origin, size: size))
-        w.raise()
+        if let c = containers[id] {
+            c.setFrame(target)
+            c.keepHeaderVisible()
+            c.activate()
+        } else if let w = tracker.windows[id] {
+            place(w, target)
+            w.raise()
+        }
     }
 
     /// Put every window back on screen. Must run before we quit, or parked
     /// windows stay stranded in the screen corner.
     func ungroupAll() {
-        for g in groups { dissolve(g) }
+        for g in Array(groups) { dissolve(g) }
     }
 
     private func remove(_ id: CGWindowID, from g: TabGroup) {
         guard let i = g.tabs.firstIndex(of: id) else { return }
+        let wasActive = g.active == id
         g.tabs.remove(at: i)
-        if g.tabs.count < 2 { dissolve(g); return }
-        if g.active == id {
+        if g.tabs.count < 2 {
+            // A container can live as a one-tab group; a normal window cannot.
+            if g.tabs.contains(where: { containers[$0] != nil }) {
+                if wasActive { select(g.tabs[0], in: g) } else { refreshTabs(g) }
+            } else {
+                dissolve(g)
+            }
+            return
+        }
+        if wasActive {
             select(g.tabs[min(i, g.tabs.count - 1)], in: g)
         } else {
             refreshTabs(g)
@@ -190,15 +330,74 @@ final class GroupManager {
         discard(g)
         let order = g.tabs.filter { $0 == g.active } + g.tabs.filter { $0 != g.active }
         for (n, id) in order.enumerated() {
-            guard let w = tracker.windows[id] else { continue }
             let step = CGFloat(n) * 28
-            place(w, g.frame.offsetBy(dx: step, dy: step))
+            let target = g.frame.offsetBy(dx: step, dy: step)
+            if let c = containers[id] {
+                c.setFrame(target)
+                c.keepHeaderVisible()
+                c.activate()
+            } else if let w = tracker.windows[id] {
+                place(w, target)
+            }
         }
     }
 
     private func discard(_ g: TabGroup) {
         groups.removeAll { $0 === g }
         g.strip.orderOut(nil)
+    }
+
+    // MARK: Containers
+
+    /// 把一个新的容器作为（目前唯一的）tab 放进一个分组。
+    func addContainer(_ container: Container) {
+        guard container.count > 0,
+              !groups.contains(where: { $0.tabs.contains(container.anchorID) }) else { return }
+        let strip = TabStripPanel()
+        strip.stripDelegate = self
+        // 和普通窗口一样：标签条从窗口顶部占 34 px，而不是让整组向上长。
+        let groupFrame = container.frame
+        let g = TabGroup(tabs: [container.anchorID], active: container.anchorID,
+                         frame: groupFrame, strip: strip)
+        groups.append(g)
+        container.setFrame(g.windowFrame)
+        select(container.anchorID, in: g)
+    }
+
+    /// 把窗口从分组里摘出来交给容器；不还原它的位置。
+    func detachForContainer(_ id: CGWindowID) {
+        guard let g = group(of: id), let i = g.tabs.firstIndex(of: id) else { return }
+        g.tabs.remove(at: i)
+        sizeBeforeGrouping[id] = nil
+        if g.tabs.isEmpty {
+            discard(g)
+            return
+        }
+        if g.tabs.count < 2 {
+            if g.tabs.contains(where: { containers[$0] != nil }) {
+                if g.active == id { select(g.tabs[0], in: g) } else { refreshTabs(g) }
+            } else {
+                dissolve(g)
+            }
+            return
+        }
+        if g.active == id {
+            select(g.tabs[min(i, g.tabs.count - 1)], in: g)
+        } else {
+            refreshTabs(g)
+        }
+    }
+
+    func closeEmptyContainer(_ container: Container) {
+        closeContainerTab(container)
+    }
+
+    func closeContainerTab(_ container: Container) {
+        let id = container.anchorID
+        if let g = group(of: id) {
+            remove(id, from: g)
+        }
+        containers.discard(container)
     }
 
     // MARK: Across restarts
@@ -209,6 +408,9 @@ final class GroupManager {
             var bundleID: String?
             var title: String
             var sizeBeforeGrouping: CGSize?
+            /// 容器 tab 的稳定标识；普通窗口为 nil。
+            var containerID: UUID? = nil
+            var customTitle: String? = nil
         }
         var tabs: [Tab]
         var active: Int
@@ -220,13 +422,22 @@ final class GroupManager {
     /// On quit (before `ungroupAll`), so an update or a restart brings the
     /// groups back. Not on "Ungroup all": that's meant.
     func save() {
+        containers.save()
         let saved = groups.map { g in
-            SavedGroup(tabs: g.tabs.compactMap { id in
-                tracker.windows[id].map {
-                    SavedGroup.Tab(id: id, bundleID: NSRunningApplication(processIdentifier: $0.pid)?.bundleIdentifier,
-                                   title: $0.title, sizeBeforeGrouping: sizeBeforeGrouping[id])
+            let tabs: [SavedGroup.Tab] = g.tabs.compactMap { id in
+                if let c = containers[id] {
+                    return SavedGroup.Tab(id: 0, bundleID: nil, title: c.title,
+                                          sizeBeforeGrouping: nil, containerID: c.uuid)
                 }
-            }, active: g.tabs.firstIndex(of: g.active) ?? 0, frame: g.frame)
+                return tracker.windows[id].map {
+                    SavedGroup.Tab(id: id,
+                                   bundleID: NSRunningApplication(processIdentifier: $0.pid)?.bundleIdentifier,
+                                   title: $0.title,
+                                   sizeBeforeGrouping: sizeBeforeGrouping[id],
+                                   customTitle: customTitles[id])
+                }
+            }
+            return SavedGroup(tabs: tabs, active: g.tabs.firstIndex(of: g.active) ?? 0, frame: g.frame)
         }
         UserDefaults.standard.set(try? JSONEncoder().encode(saved), forKey: Self.savedKey)
     }
@@ -235,34 +446,59 @@ final class GroupManager {
     /// still have the same IDs. One that doesn't (its app restarted too) is
     /// looked up by app and title, if that's unambiguous.
     func restore() {
+        let restoredContainers = containers.restore()
         guard let data = UserDefaults.standard.data(forKey: Self.savedKey),
-              let saved = try? JSONDecoder().decode([SavedGroup].self, from: data) else { return }
+              let saved = try? JSONDecoder().decode([SavedGroup].self, from: data) else {
+            restoredContainers.values.forEach { $0.activate() }
+            return
+        }
         UserDefaults.standard.removeObject(forKey: Self.savedKey)
         func bundle(_ w: Win) -> String? { NSRunningApplication(processIdentifier: w.pid)?.bundleIdentifier }
         var used = Set<CGWindowID>()
         func find(_ t: SavedGroup.Tab) -> Win? {
-            if let w = tracker.windows[t.id], !used.contains(w.id), bundle(w) == t.bundleID { return w }
-            let same = tracker.windows.values.filter { !used.contains($0.id) && bundle($0) == t.bundleID && $0.title == t.title }
+            if let w = tracker.windows[t.id], !used.contains(w.id),
+               !containers.isChild(w.id), bundle(w) == t.bundleID { return w }
+            let same = tracker.windows.values.filter {
+                !used.contains($0.id) && !containers.isChild($0.id)
+                    && bundle($0) == t.bundleID && $0.title == t.title
+            }
             return same.count == 1 ? same[0] : nil
         }
 
         let front = NSWorkspace.shared.frontmostApplication
+        var usedContainerIDs = Set<UUID>()
         for s in saved {
             var tabs: [CGWindowID] = []
             var active: CGWindowID?
             for (i, t) in s.tabs.enumerated() {
+                if let containerID = t.containerID {
+                    guard let c = restoredContainers[containerID] else { continue }
+                    let id = c.anchorID
+                    used.insert(id)
+                    usedContainerIDs.insert(containerID)
+                    tabs.append(id)
+                    if i == s.active { active = id }
+                    continue
+                }
                 guard let w = find(t) else { continue }
                 used.insert(w.id)
                 tabs.append(w.id)
                 if let size = t.sizeBeforeGrouping { sizeBeforeGrouping[w.id] = size }
+                if let custom = t.customTitle, !custom.isEmpty { customTitles[w.id] = custom }
                 if i == s.active { active = w.id }
             }
-            guard tabs.count >= 2 else { continue }
+            guard !tabs.isEmpty, tabs.count >= 2 || tabs.contains(where: { containers.isContainer($0) }) else {
+                continue
+            }
             let strip = TabStripPanel()
             strip.stripDelegate = self
             let g = TabGroup(tabs: tabs, active: active ?? tabs[0], frame: s.frame, strip: strip)
             groups.append(g)
             select(g.active, in: g)
+        }
+        // 未挂进任何分组的容器变成独立容器窗口。
+        for (uuid, c) in restoredContainers where !usedContainerIDs.contains(uuid) {
+            c.activate()
         }
         // Showing each group's tab activated its app: give focus back.
         front?.activate()
@@ -343,7 +579,11 @@ final class GroupManager {
     private func stack(_ g: TabGroup) {
         g.parked = false
         for id in g.tabs where id != g.active {
-            if let w = tracker.windows[id], w.frame != g.windowFrame { place(w, g.windowFrame) }
+            if let c = containers[id] {
+                if c.frame != g.windowFrame { c.setFrame(g.windowFrame) }
+            } else if let w = tracker.windows[id], w.frame != g.windowFrame {
+                place(w, g.windowFrame)
+            }
         }
     }
 
@@ -354,7 +594,15 @@ final class GroupManager {
         guard !g.parked else { return }
         g.parked = true
         let spot = parkSpot(in: g)
-        moveTogether(g.tabs.filter { $0 != g.active }.compactMap { tracker.windows[$0] }.map { ($0, spot) })
+        var moves: [(Win, CGPoint)] = []
+        for id in g.tabs where id != g.active {
+            if let c = containers[id] {
+                c.setFrame(CGRect(origin: spot, size: g.windowFrame.size))
+            } else if let w = tracker.windows[id] {
+                moves.append((w, spot))
+            }
+        }
+        moveTogether(moves)
     }
 
     private func parkSpot(in g: TabGroup) -> CGPoint {
@@ -399,7 +647,7 @@ final class GroupManager {
             // A maximised window: the strip takes its room from the window,
             // not from the Dock (a bottom already past it stays where it was).
             g.frame.size.height = min(g.frame.height, max(visible.maxY, bottom) - visible.minY)
-            if let w = tracker.windows[g.active] { place(w, g.windowFrame) }
+            placeTab(g.active, in: g, at: g.windowFrame)
         }
         stack(g)
         refreshTabs(g)
@@ -407,11 +655,16 @@ final class GroupManager {
     }
 
     private func refreshTabs(_ g: TabGroup) {
-        let items = g.tabs.compactMap { id in
-            tracker.windows[id].map { TabItem(id: id, title: $0.title, icon: $0.icon) }
+        let items = g.tabs.compactMap { id -> TabItem? in
+            guard let title = tabTitle(id) else { return nil }
+            return TabItem(id: id, title: title, icon: tabIcon(id))
         }
         // The key goes to the shown tab's own tabs then: no hints.
-        let hints = tracker.windows[g.active].map { !SwitchKey.current.yields(to: $0) } ?? true
+        let hintWindow = tracker.windows[g.active]
+            ?? containers[g.active].flatMap { c in
+                c.activeChild.flatMap { tracker.windows[$0] }
+            }
+        let hints = hintWindow.map { !SwitchKey.current.yields(to: $0) } ?? true
         g.strip.update(items: items, active: g.active, hints: hints)
     }
 
@@ -503,10 +756,18 @@ final class GroupManager {
 // MARK: - Window events
 
 extension GroupManager: WindowTrackerDelegate {
-    func windowMoved(_ w: Win) { follow(w) }
-    func windowResized(_ w: Win) { follow(w) }
+    func windowMoved(_ w: Win) {
+        if containers.handle(w, .moved) { return }
+        follow(w)
+    }
+
+    func windowResized(_ w: Win) {
+        if containers.handle(w, .resized) { return }
+        follow(w)
+    }
 
     func windowDestroyed(_ w: Win) {
+        if containers.handle(w, .destroyed) { return }
         // A closed native tab leaves its tab group alive, focused at its
         // sibling. Finder only moves focus just after the destroy: give it a
         // beat, then let the group follow the sibling. Otherwise the window
@@ -524,6 +785,7 @@ extension GroupManager: WindowTrackerDelegate {
         } else {
             remember(w)
             sizeBeforeGrouping[w.id] = nil
+            customTitles[w.id] = nil
         }
     }
 
@@ -537,10 +799,23 @@ extension GroupManager: WindowTrackerDelegate {
     }
 
     func windowTitleChanged(_ w: Win) {
+        if containers.handle(w, .titleChanged) { return }
         if let g = group(of: w.id) { refreshTabs(g) }
     }
 
     func windowFocused(_ w: Win) {
+        if let c = containers.container(forChild: w.id) {
+            _ = containers.handle(w, .focused)
+            focused = c.anchorID
+            if let g = group(of: c.anchorID) {
+                if g.active == c.anchorID {
+                    reorderStrip(g)
+                } else {
+                    select(c.anchorID, in: g)
+                }
+            }
+            return
+        }
         focused = w.id
         guard let g = group(of: w.id) else { return }
         if g.active == w.id {
@@ -555,7 +830,7 @@ extension GroupManager: WindowTrackerDelegate {
         focused = nil   // windowFocused follows when a tracked window has focus
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.2) { [weak self] in
             MainActor.assumeIsolated {
-                guard let self, !self.groups.isEmpty,
+                guard let self,
                       let list = CGWindowListCopyWindowInfo(.optionOnScreenOnly, kCGNullWindowID) as? [[String: Any]]
                 else { return }
                 let order = list.compactMap { ($0[kCGWindowNumber as String] as? Int).map { CGWindowID($0) } }
@@ -579,12 +854,30 @@ extension GroupManager: WindowTrackerDelegate {
                         self.remove(id, from: g)
                     }
                 }
+                // Container children: some apps only hide a window on close
+                // (⌘W). Remove it so its pane collapses and siblings reflow.
+                if NSEvent.pressedMouseButtons & 1 == 0 {
+                    for c in Array(self.containers.containers.values) {
+                        if let g = self.group(of: c.anchorID), g.parked { continue }
+                        guard onScreen.contains(c.anchorID)
+                                || c.children.values.contains(where: { onScreen.contains($0.id) })
+                        else { continue }
+                        for id in Array(c.order) where !onScreen.contains(id) {
+                            guard let w = self.tracker.windows[id] else { continue }
+                            let hidden = NSRunningApplication(processIdentifier: w.pid)?.isHidden ?? true
+                            guard hidden == false else { continue }
+                            self.containers.removeChild(id)
+                        }
+                    }
+                }
                 // Activating an app (⌘Tab, the Dock) can bring all its windows
                 // forward, hidden tabs included, without focusing them: the
                 // group then shows whichever tab ended up on top.
                 for g in self.groups where !g.parked {
                     guard let top = order.first(where: g.tabs.contains), top != g.active else { continue }
+                    self.containers[g.active]?.deactivate()
                     g.active = top
+                    if let c = self.containers[top] { c.markActive() }
                     self.refreshTabs(g)
                     self.reorderStrip(g)
                 }
@@ -593,6 +886,7 @@ extension GroupManager: WindowTrackerDelegate {
     }
 
     func windowMinimized(_ w: Win) {
+        if containers.handle(w, .minimized) { return }
         // Prototype choice: a minimised tab leaves its group.
         // (TrellisWM minimises the whole group from the strip instead.)
         if let g = group(of: w.id) { remove(w.id, from: g) }
@@ -611,7 +905,12 @@ extension GroupManager: TabStripDelegate {
     }
 
     func tabStrip(_ strip: TabStripPanel, didClose id: CGWindowID) {
-        guard let g = group(for: strip), let w = tracker.windows[id] else { return }
+        guard let g = group(for: strip) else { return }
+        if let c = containers[id] {
+            closeContainerTab(c)
+            return
+        }
+        guard let w = tracker.windows[id] else { return }
         // Show it first: a "Save changes?" sheet on a parked window would be invisible.
         if g.active != id { select(id, in: g) }
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.1) {
@@ -630,5 +929,91 @@ extension GroupManager: TabStripDelegate {
         tearOff(id, at: point)
     }
 
-    func tabStripUngroupAll(_ strip: TabStripPanel) { ungroupAll() }
+    func tabStrip(_ strip: TabStripPanel, didRename id: CGWindowID, to title: String) {
+        if let c = containers[id] {
+            c.setCustomTitle(title)
+        } else {
+            let trimmed = title.trimmingCharacters(in: .whitespacesAndNewlines)
+            customTitles[id] = trimmed.isEmpty ? nil : trimmed
+        }
+        if let g = group(for: strip) { refreshTabs(g) }
+    }
+
+    func tabStrip(_ strip: TabStripPanel, didFinishRenaming id: CGWindowID) {
+        guard let g = group(for: strip) else { return }
+        select(g.active, in: g)
+    }
+
+    func tabStripUngroupAll(_ strip: TabStripPanel) {
+        guard let g = group(for: strip) else { return }
+        dissolve(g)
+    }
+}
+
+// MARK: - Container events
+
+extension GroupManager: ContainerDelegate {
+    func containerFrameChanged(_ container: Container) {
+        guard let g = group(of: container.anchorID), g.active == container.anchorID else { return }
+        let shellFrame = container.frame
+        g.frame = CGRect(x: shellFrame.minX, y: shellFrame.minY - Style.stripHeight,
+                         width: shellFrame.width, height: shellFrame.height + Style.stripHeight)
+        g.strip.setFrame(Coords.toAppKit(g.stripFrame), display: true)
+        g.strip.order(.above, relativeTo: Int(g.active))
+        if NSEvent.pressedMouseButtons & 1 != 0 { parkHidden(g) }
+    }
+
+    func containerInteractionEnded(_ container: Container) {
+        if let g = group(of: container.anchorID) {
+            if g.active == container.anchorID { layout(g) }
+            return
+        }
+        container.keepHeaderVisible()
+    }
+
+    func containerZoomRequested(_ container: Container) {
+        let visible = Coords.visibleFrame(containing: container.frame)
+        guard visible.width > 0, visible.height > 0 else { return }
+        if let g = group(of: container.anchorID) {
+            g.frame = visible
+            placeTab(g.active, in: g, at: g.windowFrame)
+            layout(g)
+        } else {
+            container.setFrame(visible)
+        }
+    }
+
+    func containerNeedsTabRefresh(_ container: Container) {
+        if let g = group(of: container.anchorID) { refreshTabs(g) }
+    }
+
+    func containerRequestedClose(_ container: Container) {
+        closeContainerTab(container)
+    }
+
+    func containerDidBecomeEmpty(_ container: Container) {
+        closeContainerTab(container)
+    }
+
+    func container(_ container: Container, requestedGroupAt point: CGPoint) {
+        guard group(of: container.anchorID) == nil else { return }
+        guard NSEvent.modifierFlags.contains(DragKey.current.nsFlag) else { return }
+
+        if let g = group(atStrip: point) {
+            join(container, into: g)
+            return
+        }
+        guard let w = tracker.topWindow(at: point), let f = w.frame else { return }
+        let inner = f.insetBy(dx: f.width * 0.25, dy: f.height * 0.25)
+        if let target = containers.container(forChild: w.id), target !== container, inner.contains(point) {
+            if let g = group(of: target.anchorID) {
+                join(container, into: g)
+            } else {
+                join(container, onto: target)
+            }
+            return
+        }
+        guard !containers.isChild(w.id), inner.contains(point) else { return }
+        join(container, onto: w)
+    }
 }

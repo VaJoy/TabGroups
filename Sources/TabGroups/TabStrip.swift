@@ -14,6 +14,8 @@ protocol TabStripDelegate: AnyObject {
     /// `point` is where the tab was dropped; nil when it came from the context menu.
     func tabStrip(_ strip: TabStripPanel, didTearOff id: CGWindowID, at point: CGPoint?)
     func tabStripUngroupAll(_ strip: TabStripPanel)
+    func tabStrip(_ strip: TabStripPanel, didRename id: CGWindowID, to title: String)
+    func tabStrip(_ strip: TabStripPanel, didFinishRenaming id: CGWindowID)
 }
 
 /// The strip is our own window, sat directly above the group's shown window.
@@ -24,6 +26,7 @@ final class TabStripPanel: NSPanel {
     weak var stripDelegate: TabStripDelegate?
     private let tabsView = TabStripView()
     private let shadowPanel = StripShadow()
+    private let renameEditor = TabRenameEditor()
 
     init() {
         super.init(contentRect: NSRect(x: 0, y: 0, width: 400, height: Style.stripHeight),
@@ -70,12 +73,17 @@ final class TabStripPanel: NSPanel {
         order(.above, relativeTo: Int(windowID))
     }
 
+    func beginRenaming(_ item: TabItem, at screenRect: NSRect) {
+        renameEditor.show(item: item, screenRect: screenRect, strip: self)
+    }
+
     override func setFrame(_ frameRect: NSRect, display flag: Bool) {
         super.setFrame(frameRect, display: flag)
         shadowPanel.fit(under: frameRect)
     }
 
     override func orderOut(_ sender: Any?) {
+        renameEditor.dismiss()
         removeChildWindow(shadowPanel)
         shadowPanel.orderOut(nil)
         super.orderOut(sender)
@@ -248,11 +256,22 @@ final class TabStripView: NSView {
     override func mouseDown(with event: NSEvent) {
         let p = convert(event.locationInWindow, from: nil)
         guard let i = index(at: p) else { return }
+        if event.clickCount == 2 {
+            beginRename(at: i)
+            return
+        }
         pressedID = items[i].id
         pressPoint = p
         grabX = p.x - tabRect(i).minX
         dragging = false
         torn = false
+    }
+
+    private func beginRename(at i: Int) {
+        guard let owner, let window else { return }
+        let windowRect = convert(tabRect(i), to: nil)
+        let screenRect = window.convertToScreen(windowRect)
+        owner.beginRenaming(items[i], at: screenRect)
     }
 
     override func mouseDragged(with event: NSEvent) {
@@ -458,5 +477,130 @@ extension NSImage {
         image.capInsets = NSEdgeInsets(top: radius, left: radius, bottom: radius, right: radius)
         image.resizingMode = .stretch
         return image
+    }
+}
+
+/// Inline tab-rename field: a small key panel above the strip. Enter commits,
+/// Escape cancels, clicking elsewhere commits; focus returns to the active tab.
+@MainActor
+final class TabRenameEditor: NSPanel, NSTextFieldDelegate, NSWindowDelegate {
+    private let field = NSTextField()
+    private weak var strip: TabStripPanel?
+    private var itemID: CGWindowID?
+    private var finished = true
+    private var monitor: Any?
+
+    init() {
+        super.init(contentRect: .zero, styleMask: [.borderless, .nonactivatingPanel],
+                   backing: .buffered, defer: true)
+        isOpaque = false
+        backgroundColor = .clear
+        hasShadow = true
+        hidesOnDeactivate = false
+        isReleasedWhenClosed = false
+        level = .floating
+        collectionBehavior = [.ignoresCycle, .transient]
+        animationBehavior = .none
+
+        let background = NSView()
+        background.wantsLayer = true
+        background.layer?.backgroundColor = NSColor(srgbRed: 26 / 255, green: 28 / 255,
+                                                     blue: 31 / 255, alpha: 0.96).cgColor
+        background.layer?.cornerRadius = 7
+        background.layer?.masksToBounds = true
+        background.layer?.borderColor = NSColor.white.withAlphaComponent(0.18).cgColor
+        background.layer?.borderWidth = 1
+        background.autoresizingMask = [.width, .height]
+
+        field.isBordered = false
+        field.drawsBackground = false
+        field.isEditable = true
+        field.isSelectable = true
+        field.focusRingType = .none
+        field.textColor = .white
+        field.font = .systemFont(ofSize: 12.5, weight: .semibold)
+        field.lineBreakMode = .byClipping
+        field.cell?.isScrollable = true
+        field.cell?.wraps = false
+        field.cell?.usesSingleLineMode = true
+        field.delegate = self
+        background.addSubview(field)
+        contentView = background
+        delegate = self
+    }
+
+    override var canBecomeKey: Bool { true }
+    override var canBecomeMain: Bool { false }
+
+    func show(item: TabItem, screenRect: NSRect, strip: TabStripPanel) {
+        if !finished { finish(commit: true, restoreFocus: false) }
+        finished = false
+        self.strip = strip
+        itemID = item.id
+        setFrame(screenRect, display: false)
+        if let content = contentView {
+            field.frame = NSRect(x: 8, y: 4,
+                                 width: max(0, content.bounds.width - 16),
+                                 height: max(16, content.bounds.height - 8))
+        }
+        field.stringValue = item.title
+        orderFrontRegardless()
+        NSApp.activate(ignoringOtherApps: true)
+        makeKeyAndOrderFront(nil)
+        makeFirstResponder(field)
+        field.selectText(nil)
+
+        monitor = NSEvent.addLocalMonitorForEvents(matching: [.leftMouseDown]) { [weak self] event in
+            guard let self, !self.finished else { return event }
+            if !self.frame.contains(NSEvent.mouseLocation) {
+                self.finish(commit: true, restoreFocus: false)
+            }
+            return event
+        }
+    }
+
+    /// Called when the strip itself goes away.
+    func dismiss() {
+        finish(commit: true, restoreFocus: false)
+    }
+
+    private func finish(commit: Bool, restoreFocus: Bool) {
+        guard !finished else { return }
+        finished = true
+        if let monitor { NSEvent.removeMonitor(monitor); self.monitor = nil }
+        let id = itemID
+        let strip = strip
+        let text = field.stringValue.trimmingCharacters(in: .whitespacesAndNewlines)
+        orderOut(nil)
+        if let id, let strip {
+            if commit {
+                strip.stripDelegate?.tabStrip(strip, didRename: id, to: text)
+            }
+            if restoreFocus {
+                strip.stripDelegate?.tabStrip(strip, didFinishRenaming: id)
+            }
+        }
+        itemID = nil
+        self.strip = nil
+    }
+
+    func control(_ control: NSControl, textView: NSTextView, doCommandBy commandSelector: Selector) -> Bool {
+        if commandSelector == #selector(NSResponder.insertNewline(_:)) {
+            finish(commit: true, restoreFocus: true)
+            return true
+        }
+        if commandSelector == #selector(NSResponder.insertTab(_:)) {
+            finish(commit: true, restoreFocus: true)
+            return true
+        }
+        if commandSelector == #selector(NSResponder.cancelOperation(_:)) {
+            finish(commit: false, restoreFocus: true)
+            return true
+        }
+        return false
+    }
+
+    func windowDidResignKey(_ notification: Notification) {
+        finish(commit: true, restoreFocus: false)
     }
 }

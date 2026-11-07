@@ -32,6 +32,22 @@ final class Win {
 
     var frame: CGRect? { AX.frame(element) }
 
+    /// 该窗口能接受的最小尺寸（没有暴露就退回一个保守值）。
+    var minSize: CGSize {
+        if let v = AX.attr(element, "AXMinSize"), CFGetTypeID(v) == AXValueGetTypeID() {
+            var size = CGSize.zero
+            if AXValueGetValue(v as! AXValue, .cgSize, &size), size.width > 0, size.height > 0 {
+                return size
+            }
+        }
+        return CGSize(width: 180, height: 110)
+    }
+
+    /// 只把窗口提到前面，不抢键盘焦点（容器整体激活时用）。
+    func orderFront() {
+        AX.perform(element, kAXRaiseAction)
+    }
+
     /// The WindowServer's bounds: current even mid-drag, while the app's AX
     /// position lags behind it.
     var serverFrame: CGRect? {

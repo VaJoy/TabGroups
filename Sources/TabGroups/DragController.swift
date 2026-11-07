@@ -27,6 +27,15 @@ enum DragKey: String, CaseIterable {
         case .fn: "fn"
         }
     }
+
+    var nsFlag: NSEvent.ModifierFlags {
+        switch self {
+        case .command: .command
+        case .option: .option
+        case .control: .control
+        case .fn: .function
+        }
+    }
 }
 
 /// Held with 1…9, it switches tabs in the focused window's group. ⌥ by
@@ -93,8 +102,41 @@ final class DragController {
     private var moving = false
     private var ticker: Timer?
 
-    private var target: Win?
-    private var targetZone: CGRect = .zero
+    @MainActor
+    private enum DropTarget {
+        case window(Win, CGRect)
+        /// ⌘ 拖到容器上：把窗口加成容器所在分组的一个 tab。
+        case containerTab(Container, CGRect)
+        /// ⇧ 拖到容器里：把窗口加成容器子窗口。
+        case containerInsert(Container, CGWindowID?, CGRect)
+        /// ⇧ 把窗口拖到另一个普通窗口上：新建容器。
+        case newContainer(Win, CGRect)
+
+        var area: CGRect {
+            switch self {
+            case let .window(_, rect): rect
+            case let .containerTab(_, rect): rect
+            case let .containerInsert(_, _, rect): rect
+            case let .newContainer(_, rect): rect
+            }
+        }
+
+        var key: String {
+            switch self {
+            case let .window(w, _): "w-\(w.id)"
+            case let .containerTab(c, _): "ct-\(c.anchorID)"
+            case let .containerInsert(c, child, _): "ci-\(c.anchorID)-\(child ?? 0)"
+            case let .newContainer(w, _): "nc-\(w.id)"
+            }
+        }
+
+        var usesStrip: Bool {
+            if case .window = self { return true }
+            return false
+        }
+    }
+
+    private var dropTarget: DropTarget?
     private var anchor: CGPoint = .zero
     private var since = Date.distantFuture
     private var armed = false
@@ -104,6 +146,7 @@ final class DragController {
     /// (`CGEventSource.flagsState`) drops it for a moment when a dragged
     /// window crosses to another display.
     private var keyHeld = false
+    private var shiftHeld = false
     /// Also from the event stream: while the tap swallows a drag,
     /// `NSEvent.mouseLocation` stays where the button went down.
     private var pointer: CGPoint = .zero
@@ -154,6 +197,7 @@ final class DragController {
         if type == .keyDown { return !switchTab(event) }
         if type != .tapDisabledByTimeout && type != .tapDisabledByUserInput {
             keyHeld = event.flags.contains(DragKey.current.flag)
+            shiftHeld = event.flags.contains(.maskShift)
             pointer = event.location
         }
         switch type {
@@ -193,8 +237,10 @@ final class DragController {
         let mods = event.flags.intersection([.maskCommand, .maskShift, .maskAlternate, .maskControl])
         guard mods == key.flags,
               let n = Self.digitKeys.firstIndex(of: event.getIntegerValueField(.keyboardEventKeycode)),
-              let id = groups.focused, let g = groups.group(of: id),
-              let w = tracker.windows[id], !key.yields(to: w) else { return false }
+              let id = groups.focused, let g = groups.group(of: id) else { return false }
+        if let w = tracker.windows[id], key.yields(to: w) { return false }
+        if let c = groups.containers[id], let child = c.activeChild,
+           let w = tracker.windows[child], key.yields(to: w) { return false }
         let i = n == 8 ? g.tabs.count - 1 : n
         // Out of range or held down: still ours, the app's own use would confuse.
         if i < g.tabs.count, event.getIntegerValueField(.keyboardEventAutorepeat) == 0, g.tabs[i] != g.active {
@@ -213,7 +259,8 @@ final class DragController {
         let n = NSWindow.windowNumber(at: NSPoint(x: p.x, y: Coords.primaryHeight - p.y),
                                       belowWindowWithWindowNumber: 0)
         guard NSApp.window(withWindowNumber: n).map({ $0.ignoresMouseEvents }) ?? true,
-              let w = tracker.topWindow(at: p), let f = w.frame else { return false }
+              let w = tracker.topWindow(at: p), let f = w.frame,
+              !groups.containers.isChild(w.id) else { return false }
         reset()
         source = w
         sourceStart = f
@@ -281,64 +328,148 @@ final class DragController {
     }
 
     private func mouseUp() {
-        let go = moving && armed && keyHeld
-        let src: Win? = go ? source : nil
-        let dst: Win? = go ? target : nil
+        let target = armed ? dropTarget : nil
+        let containerKey = shiftHeld
+        let dragKey = keyHeld
+        let src = source
+        let startFrame = sourceStart
         reset()
-        guard let src, let dst else { return }
+        guard let target, let src else { return }
         // Let the WindowServer finish its own drag first.
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.05) { [weak self] in
-            MainActor.assumeIsolated { self?.groups.join(src, onto: dst) }
+            MainActor.assumeIsolated {
+                guard let self else { return }
+                switch target {
+                case let .containerInsert(container, child, _):
+                    if containerKey {
+                        _ = self.groups.containers.insert(src, into: container,
+                                                          targetChild: child, at: self.pointer,
+                                                          sourceFrame: startFrame)
+                    }
+                case let .newContainer(window, _):
+                    if containerKey {
+                        _ = self.groups.containers.create(from: src, and: window, at: self.pointer,
+                                                          sourceFrame: startFrame)
+                    }
+                case let .containerTab(container, _):
+                    if dragKey { self.groups.join(src, ontoContainer: container) }
+                case let .window(window, _):
+                    if dragKey { self.groups.join(src, onto: window) }
+                }
+            }
         }
     }
 
     private func evaluate() {
         guard moving, let src = source else { return }
-        guard keyHeld else { disarm(); return }
         let p = pointer
-        let sourceTabs = Set(groups.group(of: src.id)?.tabs ?? [src.id])
+        var excluded = Set(groups.group(of: src.id)?.tabs ?? [src.id])
+        if let c = groups.containers.container(forChild: src.id) {
+            excluded.formUnion(c.children.keys)
+        }
 
-        var candidate: Win?
-        var zone: CGRect?
-        if let g = groups.group(atStrip: p), !g.tabs.contains(src.id) {
-            candidate = tracker.windows[g.active]
-            zone = g.frame
-        } else if let w = tracker.topWindow(at: p, excluding: sourceTabs) {
-            candidate = w
-            if let g = groups.group(of: w.id) {
-                zone = g.frame
+        if shiftHeld {
+            if let target = containerTarget(at: p, excluding: excluded, source: src) {
+                setDropTarget(target, at: p, immediate: true)
             } else {
-                zone = (w.id == target?.id) ? targetZone : w.frame
+                disarm()
+            }
+            return
+        }
+
+        guard keyHeld else { disarm(); return }
+        if let target = groupTarget(at: p, excluding: excluded, source: src) {
+            setDropTarget(target, at: p, immediate: false)
+        } else {
+            disarm()
+        }
+    }
+
+    private func isMiddle(_ rect: CGRect, _ p: CGPoint) -> Bool {
+        rect.insetBy(dx: rect.width * middleInset, dy: rect.height * middleInset).contains(p)
+    }
+
+    private func containerTarget(at p: CGPoint, excluding: Set<CGWindowID>, source: Win) -> DropTarget? {
+        if let (container, child) = groups.containers.target(at: p, excluding: excluding) {
+            guard container.isActive, !container.children.keys.contains(source.id),
+                  container.count < Container.maxChildren else { return nil }
+            let content = container.contentFrame
+            // “拖到容器中间”优先当成整容器插入：选面积最大的 pane 再二分。
+            if content.insetBy(dx: content.width * 0.3, dy: content.height * 0.3).contains(p) {
+                return .containerInsert(container, nil, content)
+            }
+            if let child, let zone = container.frame(of: child) {
+                guard isMiddle(zone, p) else { return nil }
+                return .containerInsert(container, child, zone)
+            }
+            return .containerInsert(container, nil, content)
+        }
+        if let w = tracker.topWindow(at: p, excluding: excluding), w.id != source.id,
+           !groups.containers.isChild(w.id), let f = w.frame, isMiddle(f, p) {
+            return .newContainer(w, f)
+        }
+        return nil
+    }
+
+    private func groupTarget(at p: CGPoint, excluding: Set<CGWindowID>, source: Win) -> DropTarget? {
+        if let g = groups.group(atStrip: p), !g.tabs.contains(source.id) {
+            if let c = groups.containers[g.active] {
+                return .containerTab(c, g.frame)
+            }
+            if let w = tracker.windows[g.active] {
+                return .window(w, g.frame)
             }
         }
-
-        guard let c = candidate, let z = zone, !sourceTabs.contains(c.id),
-              z.insetBy(dx: z.width * middleInset, dy: z.height * middleInset).contains(p)
-        else { disarm(); return }
-
-        if c.id != target?.id {
-            target = c
-            targetZone = z
-            anchor = p
-            since = Date()
-            armed = false
-            highlight.hide()
+        if let w = tracker.topWindow(at: p, excluding: excluding), let f = w.frame {
+            if let c = groups.containers.container(forChild: w.id) {
+                guard !c.children.keys.contains(source.id),
+                      let childFrame = c.frame(of: w.id), isMiddle(childFrame, p) else { return nil }
+                return .containerTab(c, c.frame)
+            }
+            if groups.containers.isChild(w.id) { return nil }
+            let zone = groups.group(of: w.id)?.frame ?? f
+            return isMiddle(zone, p) ? .window(w, zone) : nil
         }
-        if hypot(p.x - anchor.x, p.y - anchor.y) > holdSlop {
-            // Travelling (again): restart the hold. Moving on after the
-            // highlight came up takes it back: only a release while still
-            // groups.
+        return nil
+    }
+
+    private func setDropTarget(_ target: DropTarget, at p: CGPoint, immediate: Bool) {
+        if target.key != dropTarget?.key {
+            dropTarget = target
             anchor = p
             since = Date()
-            if armed { armed = false; highlight.hide() }
+            armed = immediate
+            if immediate {
+                highlight.show(over: target.area, withStrip: target.usesStrip)
+            } else {
+                highlight.hide()
+            }
+            return
+        }
+        dropTarget = target
+        if hypot(p.x - anchor.x, p.y - anchor.y) > holdSlop {
+            anchor = p
+            since = Date()
+            if immediate {
+                armed = true
+                highlight.show(over: target.area, withStrip: target.usesStrip)
+            } else if armed {
+                armed = false
+                highlight.hide()
+            }
+            return
+        }
+        if immediate {
+            armed = true
+            highlight.show(over: target.area, withStrip: target.usesStrip)
         } else if !armed && Date().timeIntervalSince(since) >= holdDuration {
             armed = true
-            highlight.show(over: z)
+            highlight.show(over: target.area, withStrip: target.usesStrip)
         }
     }
 
     private func disarm() {
-        target = nil
+        dropTarget = nil
         armed = false
         highlight.hide()
     }
@@ -396,10 +527,11 @@ final class DropHighlight {
         panel.contentView = v
     }
 
-    func show(over axRect: CGRect) {
+    func show(over axRect: CGRect, withStrip: Bool = true) {
         let r = Coords.toAppKit(axRect.insetBy(dx: 6, dy: 6))
         panel.setFrame(r, display: false)
         if let strip = panel.contentView?.subviews.first {
+            strip.isHidden = !withStrip
             strip.frame = NSRect(x: 6, y: r.height - Style.stripHeight - 6,
                                  width: r.width - 12, height: Style.stripHeight)
         }
